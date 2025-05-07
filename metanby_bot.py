@@ -95,8 +95,8 @@ class Config:
         self.BOT_TOKEN = os.getenv("BOT_TOKEN")
         self.ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
         self.MODERATOR_IDS = [int(id) for id in os.getenv("MODERATOR_IDS", "").split(",") if id]
-        self.POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://user:password@localhost/dbname")
-        self.REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+        self.POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://metan_bot_user:cfCtJjVkzxiSUZnJ2ihU294jtddwxybu@dpg-d0dcki9r0fns7393mlb0-a/metan_bot")
+        self.REDIS_HOST = os.getenv("REDIS_HOST", "redis://red-d0dd20pr0fns7394268g:6379")
         self.REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
         self.REDIS_DB = int(os.getenv("REDIS_DB", 0))
         self.ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", Fernet.generate_key().decode())

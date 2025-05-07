@@ -40,6 +40,8 @@ from io import StringIO
 import json
 import sentry_sdk
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+from aiogram.webhook.aiohttp_server import setup_application
+from aiohttp import web
 
 # Создаем необходимые директории перед инициализацией приложения
 os.makedirs("static", exist_ok=True)
@@ -4047,19 +4049,25 @@ async def on_shutdown():
     redis_client.close()
 
 # Main function
-async def main():
-    logger.info("Starting bot...")
-    
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    
-    await dp.start_polling(bot)
+@app.on_event("startup")
+async def on_startup():
+    await bot.set_webhook(
+        url=config.WEBHOOK_URL,
+        secret_token=config.WEBHOOK_SECRET
+    )
+    await init_db()
+    asyncio.create_task(send_scheduled_messages())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.delete_webhook()
+    await dp.storage.close()
+    await bot.session.close()
+
+@app.post(f"/{config.WEBHOOK_PATH}")
+async def bot_webhook(update: dict):
+    telegram_update = types.Update(**update)
+    await dp.feed_update(bot, telegram_update)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        sentry_sdk.capture_exception(e)
+    uvicorn.run(app, host=config.WEBHOOK_HOST, port=config.WEBHOOK_PORT)

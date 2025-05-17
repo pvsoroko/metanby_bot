@@ -40,8 +40,8 @@ from io import StringIO
 import json
 import sentry_sdk
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
-from aiogram.webhook.aiohttp_server import setup_application
-from aiohttp import web
+from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.exceptions import TelegramBadRequest
 
 # Создаем необходимые директории перед инициализацией приложения
 os.makedirs("static", exist_ok=True)
@@ -97,17 +97,17 @@ class Config:
         self.BOT_TOKEN = os.getenv("BOT_TOKEN")
         self.ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
         self.MODERATOR_IDS = [int(id) for id in os.getenv("MODERATOR_IDS", "").split(",") if id]
-        self.POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://metan_bot_user:cfCtJjVkzxiSUZnJ2ihU294jtddwxybu@dpg-d0dcki9r0fns7393mlb0-a/metan_bot")
-        self.REDIS_HOST = os.getenv("REDIS_HOST", "redis://red-d0dd20pr0fns7394268g:6379")
-        self.REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-        self.REDIS_DB = int(os.getenv("REDIS_DB", 0))
-        self.ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+        self.POSTGRES_DSN = os.getenv("POSTGRES_DSN")
+        self.REDIS_HOST = os.getenv("REDIS_HOST")
+        self.REDIS_PORT = int(os.getenv("REDIS_PORT"))
+        self.REDIS_DB = int(os.getenv("REDIS_DB"))
+        self.ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
         self.SENTRY_DSN = os.getenv("SENTRY_DSN")
-        self.ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-        self.WEB_USERNAME = os.getenv("WEB_USERNAME", "admin")
-        self.WEB_PASSWORD = os.getenv("WEB_PASSWORD", "securepassword")
-        self.WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
-        self.WEB_PORT = int(os.getenv("WEB_PORT", 8000))
+        self.ENVIRONMENT = os.getenv("ENVIRONMENT")
+        self.WEB_USERNAME = os.getenv("WEB_USERNAME")
+        self.WEB_PASSWORD = os.getenv("WEB_PASSWORD")
+        self.WEB_HOST = os.getenv("WEB_HOST")
+        self.WEB_PORT = int(os.getenv("WEB_PORT"))
         
         if not self.BOT_TOKEN:
             raise ValueError("BOT_TOKEN is required")
@@ -118,7 +118,7 @@ config = Config()
 
 # Initialize bot and dispatcher
 bot = Bot(token=config.BOT_TOKEN)
-storage = MemoryStorage()
+storage = RedisStorage.from_url(f"redis://{config.REDIS_HOST}:{config.REDIS_PORT}/{config.REDIS_DB}")
 dp = Dispatcher(storage=storage)
 
 # Redis client
@@ -282,10 +282,10 @@ async def get_stats(
     # 1. Динамика регистраций пользователей
     users_dynamic = await pool.fetch(f"""
         SELECT 
-            date_trunc('hour', created_at) as time_point,
+            date_trunc('hour', registered_at) as time_point,
             COUNT(*) as count
         FROM users
-        WHERE created_at >= NOW() - INTERVAL '{interval}'
+        WHERE registered_at >= NOW() - INTERVAL '{interval}'
         GROUP BY time_point
         ORDER BY time_point
     """)
@@ -293,7 +293,7 @@ async def get_stats(
     # 2. Динамика вопросов
     questions_dynamic = await pool.fetch(f"""
         SELECT 
-            date_trunc('hour', created_at) as time_point,
+            date_trunc('hour', registered_at) as time_point,
             COUNT(*) as count
         FROM questions
         WHERE created_at >= NOW() - INTERVAL '{interval}'
@@ -778,7 +778,7 @@ async def init_db():
                 legal_address TEXT,
                 phone TEXT NOT NULL,
                 activity_type TEXT NOT NULL,
-                okpo TEXT NOT NULL,
+                okpo TEXT,
                 unp TEXT NOT NULL,
                 account_number TEXT NOT NULL,
                 bank_name TEXT NOT NULL,
@@ -855,6 +855,16 @@ async def init_db():
                 ('button_delayed_messages', '1')
             ON CONFLICT (key) DO NOTHING
             """)
+			
+            await conn.execute("""
+            INSERT INTO bot_settings (key, value) VALUES 
+                ('notify_admin_questions', '1'),
+                ('notify_admin_contracts', '1'),
+                ('notify_admin_errors', '1'),
+                ('notify_moderators_questions', '1'),
+                ('notify_moderators_contracts', '1')
+            ON CONFLICT (key) DO NOTHING
+            """)
             
             logger.info("Database initialized successfully")
     except Exception as e:
@@ -897,33 +907,72 @@ async def is_button_enabled(button_key: str) -> bool:
         sentry_sdk.capture_exception(e)
         return True
 
-async def notify_admins(text: str, emoji: str = EMOJI_INFO):
-    logger.info(f"Sending admin notification: {emoji} {text[:50]}...")
+async def notify_admins(text: str, emoji: str = EMOJI_INFO, notification_type: str = "info"):
+    """Отправка уведомлений админу с проверкой настроек"""
     try:
+        # Проверяем, нужно ли отправлять уведомление этого типа
+        if notification_type == "question" and not await is_notification_enabled('notify_admin_questions'):
+            logger.info("Уведомления о вопросах для админа отключены")
+            return
+        if notification_type == "contract" and not await is_notification_enabled('notify_admin_contracts'):
+            logger.info("Уведомления о договорах для админа отключены")
+            return
+        if notification_type == "error" and not await is_notification_enabled('notify_admin_errors'):
+            logger.info("Уведомления об ошибках для админа отключены")
+            return
+
         await bot.send_message(config.ADMIN_ID, f"{emoji} {text}")
-        logger.info("Admin notification sent successfully")
+        logger.info(f"Уведомление отправлено админу ({notification_type})")
     except Exception as e:
-        logger.error(f"Failed to notify admin: {e}", exc_info=True)
+        logger.error(f"Ошибка уведомления админа: {e}", exc_info=True)
         sentry_sdk.capture_exception(e)
 
-async def notify_moderators(text: str, emoji: str = EMOJI_INFO):
-    logger.info(f"Sending moderator notification: {emoji} {text[:50]}...")
+async def notify_moderators(text: str, emoji: str = EMOJI_INFO, notification_type: str = "info"):
+    """Отправка уведомлений модераторам с проверкой настроек"""
+    # Проверяем глобальную настройку для модераторов
+    if notification_type == "question" and not await is_notification_enabled('notify_moderators_questions'):
+        logger.info("Уведомления о вопросах для модераторов отключены")
+        return
+    if notification_type == "contract" and not await is_notification_enabled('notify_moderators_contracts'):
+        logger.info("Уведомления о договорах для модераторов отключены")
+        return
+
     tasks = []
     for mod_id in config.MODERATOR_IDS:
         try:
             tasks.append(bot.send_message(mod_id, f"{emoji} {text}"))
-            logger.info(f"Moderator notification sent to {mod_id}")
+            logger.info(f"Уведомление отправлено модератору {mod_id} ({notification_type})")
         except Exception as e:
-            logger.error(f"Failed to notify moderator {mod_id}: {e}", exc_info=True)
-            sentry_sdk.capture_exception(e)
+            logger.error(f"Ошибка уведомления модератора {mod_id}: {e}")
     
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.error(f"Failed to send to moderator {config.MODERATOR_IDS[i]}: {result}")
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+async def is_notification_enabled(setting_key: str) -> bool:
+    logger.info(f"Checking notification status for {setting_key}")
+    cached = redis_client.get(f"notification:{setting_key}")
+    if cached is not None:
+        logger.info(f"Notification {setting_key} status from cache: {cached == '1'}")
+        return cached == "1"
+    
+    try:
+        pool = await get_db_connection()
+        async with pool.acquire() as conn:
+            result = await conn.fetchrow(
+                "SELECT value FROM bot_settings WHERE key = $1",
+                setting_key
+            )
+            enabled = result and result['value'] == '1' if result else True
+            logger.info(f"Notification {setting_key} status from DB: {enabled}")
+        
+        redis_client.setex(f"notification:{setting_key}", 300, "1" if enabled else "0")
+        return enabled
+    except Exception as e:
+        logger.error(f"Failed to check notification status for {setting_key}: {e}", exc_info=True)
+        sentry_sdk.capture_exception(e)
+        return True
 
 async def get_user_mention(user: types.User) -> str:
-    mention = f"@{user.username}" if user.username else f"[{user.full_name}](tg://user?id={user.id})"
+    mention = f"@{user.username}" if user.username else f"[{user.full_name}](ID: {user.id})"
     logger.info(f"Generated mention for user {user.id}: {mention[:20]}...")
     return mention
 
@@ -1092,30 +1141,72 @@ async def export_legal_contracts_to_csv() -> Optional[str]:
             
             contracts_data = []
             for c in contracts:
-                contracts_data.append({
-                    'id': c['id'],
-                    'user_id': c['user_id'],
-                    'username': c['username'],
-                    'organization_name': c['organization_name'],
-                    'postal_address': c['postal_address'],
-                    'legal_address': c['legal_address'],
-                    'phone': decrypt_data(c['phone']),
-                    'activity_type': c['activity_type'],
-                    'okpo': decrypt_data(c['okpo']),
-                    'unp': decrypt_data(c['unp']),
-                    'account_number': decrypt_data(c['account_number']),
-                    'bank_name': c['bank_name'],
-                    'bank_bic': c['bank_bic'],
-                    'bank_address': c['bank_address'],
-                    'signatory_name': c['signatory_name'],
-                    'authority_basis': c['authority_basis'],
-                    'position': c['position'],
-                    'email': c['email'],
-                    'created_at': c['created_at'],
-                    'status': c['status']
-                })
+                try:
+                    # Initialize with NULL/None values
+                    contract_data = {
+                        'id': c['id'],
+                        'user_id': c['user_id'],
+                        'username': c['username'],
+                        'organization_name': c['organization_name'],
+                        'postal_address': c['postal_address'],
+                        'legal_address': c['legal_address'],
+                        'phone': None,
+                        'activity_type': c['activity_type'],
+                        'okpo': None,
+                        'unp': None,
+                        'account_number': None,
+                        'bank_name': c['bank_name'],
+                        'bank_bic': c['bank_bic'],
+                        'bank_address': c['bank_address'],
+                        'signatory_name': c['signatory_name'],
+                        'authority_basis': c['authority_basis'],
+                        'position': c['position'],
+                        'email': c['email'],
+                        'created_at': c['created_at'],
+                        'status': c['status']
+                    }
+                    
+                    # Decrypt each field separately with error handling
+                    try:
+                        if c['phone']:
+                            contract_data['phone'] = decrypt_data(c['phone'])
+                    except Exception as e:
+                        logger.error(f"Failed to decrypt phone for contract {c['id']}: {e}")
+                        contract_data['phone'] = "[decryption error]"
+                    
+                    try:
+                        if c['okpo']:
+                            contract_data['okpo'] = decrypt_data(c['okpo'])
+                    except Exception as e:
+                        logger.error(f"Failed to decrypt okpo for contract {c['id']}: {e}")
+                        contract_data['okpo'] = "[decryption error]"
+                    
+                    try:
+                        if c['unp']:
+                            contract_data['unp'] = decrypt_data(c['unp'])
+                    except Exception as e:
+                        logger.error(f"Failed to decrypt unp for contract {c['id']}: {e}")
+                        contract_data['unp'] = "[decryption error]"
+                    
+                    try:
+                        if c['account_number']:
+                            contract_data['account_number'] = decrypt_data(c['account_number'])
+                    except Exception as e:
+                        logger.error(f"Failed to decrypt account_number for contract {c['id']}: {e}")
+                        contract_data['account_number'] = "[decryption error]"
+                    
+                    contracts_data.append(contract_data)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process contract {c['id']}: {e}")
+                    continue
+            
+            if not contracts_data:
+                logger.warning("No valid contracts to export after processing")
+                return None
             
             return await export_to_csv(contracts_data, "legal_contracts.csv")
+            
     except Exception as e:
         logger.error(f"Failed to export legal contracts: {e}", exc_info=True)
         sentry_sdk.capture_exception(e)
@@ -1165,7 +1256,7 @@ async def get_main_menu(user_id: int) -> types.ReplyKeyboardMarkup:
         builder.button(text=f"{EMOJI_MONEY} Расчёт окупаемости")
     
     if await is_button_enabled('button_experience'):
-        builder.button(text=f"{EMOJI_VIDEO}{EMOJI_BOOK} Опыт эксплуатации")
+        builder.button(text=f"{EMOJI_VIDEO}{EMOJI_BOOK}Полезная информация")
     
     if await is_button_enabled('button_contract'):
         builder.button(text=f"{EMOJI_CONTRACT} Заключение договора")
@@ -1235,13 +1326,20 @@ async def get_admin_menu() -> types.ReplyKeyboardMarkup:
     builder.adjust(2, 2, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
-async def get_question_action_menu(question_id: int) -> types.InlineKeyboardMarkup:
+async def get_question_action_menu(question_id: int, has_next: bool = False, has_prev: bool = False) -> types.InlineKeyboardMarkup:
     logger.info(f"Generating question action menu for question {question_id}")
     builder = InlineKeyboardBuilder()
     builder.button(text="💪🏾 Ответить", callback_data=f"answer_{question_id}")
     builder.button(text="🙈 Пропустить", callback_data=f"skip_{question_id}")
+    
+    # Add navigation buttons if needed
+    if has_prev:
+        builder.button(text="⬅️ Предыдущий", callback_data=f"prev_question_{question_id}")
+    if has_next:
+        builder.button(text="➡️ Следующий", callback_data=f"next_question_{question_id}")
+    
     builder.button(text="👀 Скрыть", callback_data="cancel_question")
-    builder.adjust(2, 1)
+    builder.adjust(2, 2, 1)
     return builder.as_markup()
 
 async def get_confirm_menu(confirm_data: str) -> types.InlineKeyboardMarkup:
@@ -1304,7 +1402,7 @@ async def cmd_help(message: types.Message):
         "📌 Доступные функции:\n"
         f"{EMOJI_QUESTION} Консультация со специалистом - задайте вопрос и получите ответ\n"
         f"{EMOJI_MONEY} Расчёт окупаемости - калькулятор окупаемости (в разработке)\n"
-        f"{EMOJI_VIDEO}{EMOJI_BOOK} Опыт эксплуатации - полезные материалы\n"
+        f"{EMOJI_VIDEO}{EMOJI_BOOK}Полезная информация - доступ к видеоматериалам и печатным руководствам\n"
         f"{EMOJI_CONTRACT} Заключение договора - оформление договора для физ. или юр. лиц"
     )
     await message.answer(help_text)
@@ -1358,8 +1456,8 @@ async def process_question(message: types.Message, state: FSMContext):
     admin_text = f"{EMOJI_NEW} Новый вопрос от {user_mention}\n\n{question}"
     moderator_text = f"{EMOJI_NEW} Новый вопрос (ID: {user.id})\n\n{question}"
     
-    await notify_admins(admin_text, EMOJI_QUESTION)
-    await notify_moderators(moderator_text, EMOJI_QUESTION)
+    await notify_admins(admin_text, EMOJI_QUESTION, notification_type="question")
+    await notify_moderators(moderator_text, EMOJI_QUESTION, notification_type="question")
     
     await message.answer(
         "Ваш вопрос получен и передан специалисту. Мы ответим вам как можно скорее.",
@@ -1376,7 +1474,7 @@ async def roi_handler(message: types.Message):
         reply_markup=await get_main_menu(message.from_user.id)
     )
 
-@dp.message(F.text == f"{EMOJI_VIDEO}{EMOJI_BOOK} Опыт эксплуатации")
+@dp.message(F.text == f"{EMOJI_VIDEO}{EMOJI_BOOK}Полезная информация")
 async def experience_handler(message: types.Message):
     logger.info(f"User {message.from_user.id} requested experience materials")
     await message.answer(
@@ -1387,26 +1485,93 @@ async def experience_handler(message: types.Message):
 @dp.callback_query(F.data == "experience_video")
 async def experience_video_handler(callback: types.CallbackQuery):
     logger.info(f"User {callback.from_user.id} selected video materials")
-    await callback.message.edit_text(
-        "Видеоматериалы по эксплуатации:\n\n"
-        "1. Основные принципы работы: https://example.com/video1\n"
-        "2. Техническое обслуживание: https://example.com/video2\n"
-        "3. Частые проблемы и решения: https://example.com/video3",
-        reply_markup=await get_experience_menu()
-    )
-    await callback.answer()
+    
+    # Формируем новый текст
+    text_lines = [
+        r"🎥\ *Видеоматериалы по эксплуатации:*",
+        "",
+        r"1\. [Основные принципы работы](https://example\.com/video1)",
+        r"2\. [Техническое обслуживание](https://example\.com/video2)", 
+        r"3\. [Частые проблемы и решения](https://example\.com/video3)",
+        ""
+    ]
+    new_text = "\n".join(text_lines)
+    
+    # Получаем новую клавиатуру
+    new_markup = await get_experience_menu()
+    
+    # Получаем текущие параметры сообщения
+    current_text = callback.message.text
+    current_markup = callback.message.reply_markup
+    
+    try:
+        # Проверяем, есть ли реальные изменения
+        if current_text != new_text or str(current_markup) != str(new_markup):
+            await callback.message.edit_text(
+                new_text,
+                parse_mode="MarkdownV2",
+                reply_markup=new_markup
+            )
+        else:
+            await callback.answer("Уже отображаются видеоматериалы")
+            return
+            
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await callback.answer("Уже отображаются видеоматериалы")
+        else:
+            logger.error(f"Telegram API error: {e}")
+            await callback.answer("Ошибка при обновлении", show_alert=True)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        await callback.answer("Произошла ошибка", show_alert=True)
+    finally:
+        await callback.answer()
 
 @dp.callback_query(F.data == "experience_print")
 async def experience_print_handler(callback: types.CallbackQuery):
     logger.info(f"User {callback.from_user.id} selected print materials")
-    await callback.message.edit_text(
-        "Печатные материалы по эксплуатации:\n\n"
-        "1. Руководство пользователя: https://example.com/manual.pdf\n"
-        "2. Технический паспорт: https://example.com/passport.pdf\n"
-        "3. Сертификаты соответствия: https://example.com/certificates.pdf",
-        reply_markup=await get_experience_menu()
-    )
-    await callback.answer()
+    
+    # Экранируем все спецсимволы MarkdownV2
+    text_lines = [
+        r"📚 *Печатные материалы по эксплуатации:*",
+        "",
+        r"1\. [Руководство пользователя](https://example\.com/manual\.pdf)",
+        r"2\. [Технический паспорт](https://example\.com/passport\.pdf)",
+        r"3\. [Сертификаты соответствия](https://example\.com/certificates\.pdf)"
+    ]
+    new_text = "\n".join(text_lines)
+    
+    # Получаем новую клавиатуру
+    new_markup = await get_experience_menu()
+    
+    # Получаем текущие параметры сообщения
+    current_text = callback.message.text
+    current_markup = callback.message.reply_markup
+    
+    try:
+        # Проверяем, есть ли реальные изменения
+        if current_text != new_text or str(current_markup) != str(new_markup):
+            await callback.message.edit_text(
+                new_text,
+                parse_mode="MarkdownV2",
+                reply_markup=new_markup
+            )
+        else:
+            await callback.answer("Уже отображаются печатные издания")
+            return
+            
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await callback.answer("Уже отображаются печатные издания")
+        else:
+            logger.error(f"Telegram API error: {e}")
+            await callback.answer("Ошибка при обновлении", show_alert=True)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        await callback.answer("Произошла ошибка", show_alert=True)
+    finally:
+        await callback.answer()
 
 @dp.callback_query(F.data == "main_menu")
 async def back_to_main_menu_handler(callback: types.CallbackQuery):
@@ -1629,8 +1794,8 @@ async def confirm_physical_contract(callback: types.CallbackQuery, state: FSMCon
             f"Email: {validated_data.email}"
         )
         
-        await notify_admins(admin_text, EMOJI_CONTRACT)
-        await notify_moderators(moderator_text, EMOJI_CONTRACT)
+        await notify_admins(admin_text, EMOJI_CONTRACT, notification_type="contract")
+        await notify_moderators(moderator_text, EMOJI_CONTRACT, notification_type="contract")
         
         await state.clear()
         logger.info(f"Physical contract for user {user.id} saved successfully")
@@ -1931,7 +2096,7 @@ async def confirm_legal_contract(callback: types.CallbackQuery, state: FSMContex
                 validated_data.legal_address,
                 encrypt_data(validated_data.phone),
                 validated_data.activity_type,
-                encrypt_data(validated_data.okpo),
+                encrypt_data(validated_data.okpo) if validated_data.okpo is not None else None,
                 encrypt_data(validated_data.unp),
                 encrypt_data(validated_data.account_number),
                 validated_data.bank_name,
@@ -1966,8 +2131,8 @@ async def confirm_legal_contract(callback: types.CallbackQuery, state: FSMContex
             f"Email: {validated_data.email}"
         )
         
-        await notify_admins(admin_text, EMOJI_CONTRACT)
-        await notify_moderators(moderator_text, EMOJI_CONTRACT)
+        await notify_admins(admin_text, EMOJI_CONTRACT, notification_type="contract")
+        await notify_moderators(moderator_text, EMOJI_CONTRACT, notification_type="contract")
         
         await state.clear()
         logger.info(f"Legal contract for user {user.id} saved successfully")
@@ -2011,13 +2176,20 @@ async def moderator_menu_handler(message: types.Message):
 @dp.message(F.text == "📋 Неотвеченные вопросы")
 async def unanswered_questions_handler(message: types.Message):
     logger.info(f"User {message.from_user.id} requested unanswered questions")
-
+    
+    if not await is_moderator(message.from_user.id):
+        logger.warning(f"User {message.from_user.id} is not a moderator")
+        await message.answer("У вас нет доступа к этой функции.")
+        return
     
     pool = await get_db_connection()
     try:
         async with pool.acquire() as conn:
+            # Get first unanswered question
             questions = await conn.fetch(
-                "SELECT id, user_id, username, question FROM questions WHERE answer IS NULL AND skipped_at IS NULL ORDER BY created_at LIMIT 1"
+                "SELECT id, user_id, username, question FROM questions "
+                "WHERE answer IS NULL AND skipped_at IS NULL "
+                "ORDER BY created_at LIMIT 1"
             )
             
             if not questions:
@@ -2025,6 +2197,13 @@ async def unanswered_questions_handler(message: types.Message):
                 return
                 
             question = questions[0]
+            
+            # Check if there are more questions
+            has_next = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM questions WHERE id > $1 AND answer IS NULL AND skipped_at IS NULL)",
+                question['id']
+            )
+            
             question_text = (
                 f"Вопрос от пользователя {question['username'] or question['user_id']}:\n\n"
                 f"{question['question']}"
@@ -2032,19 +2211,110 @@ async def unanswered_questions_handler(message: types.Message):
             
             await message.answer(
                 question_text,
-                reply_markup=await get_question_action_menu(question['id'])
+                reply_markup=await get_question_action_menu(question['id'], has_next, False)
             )
     except Exception as e:
         logger.error(f"Failed to get unanswered questions: {e}", exc_info=True)
         sentry_sdk.capture_exception(e)
         await message.answer("Произошла ошибка при получении вопросов.")
 
+@dp.callback_query(F.data.startswith("prev_question_"))
+async def prev_question_handler(callback: types.CallbackQuery):
+    question_id = int(callback.data.split("_")[2])
+    
+    pool = await get_db_connection()
+    try:
+        async with pool.acquire() as conn:
+            # Get previous question
+            question = await conn.fetchrow(
+                "SELECT id, user_id, username, question FROM questions "
+                "WHERE id < $1 AND answer IS NULL AND skipped_at IS NULL "
+                "ORDER BY id DESC LIMIT 1",
+                question_id
+            )
+            
+            if not question:
+                await callback.answer("Это первый вопрос в списке.")
+                return
+                
+            # Check navigation availability
+            has_prev = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM questions WHERE id < $1 AND answer IS NULL AND skipped_at IS NULL)",
+                question['id']
+            )
+            has_next = True  # Since we came from a next question
+            
+            question_text = (
+                f"Вопрос от пользователя {question['username'] or question['user_id']}:\n\n"
+                f"{question['question']}"
+            )
+            
+            await callback.message.edit_text(
+                question_text,
+                reply_markup=await get_question_action_menu(question['id'], has_next, has_prev)
+            )
+    except Exception as e:
+        logger.error(f"Failed to get previous question: {e}", exc_info=True)
+        sentry_sdk.capture_exception(e)
+        await callback.answer("Произошла ошибка при загрузке вопроса.")
+    finally:
+        await callback.answer()
+
+@dp.callback_query(F.data.startswith("next_question_"))
+async def next_question_handler(callback: types.CallbackQuery):
+    question_id = int(callback.data.split("_")[2])
+    
+    pool = await get_db_connection()
+    try:
+        async with pool.acquire() as conn:
+            # Get next question
+            question = await conn.fetchrow(
+                "SELECT id, user_id, username, question FROM questions "
+                "WHERE id > $1 AND answer IS NULL AND skipped_at IS NULL "
+                "ORDER BY id LIMIT 1",
+                question_id
+            )
+            
+            if not question:
+                await callback.answer("Это последний вопрос в списке.")
+                return
+                
+            # Check navigation availability
+            has_next = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM questions WHERE id > $1 AND answer IS NULL AND skipped_at IS NULL)",
+                question['id']
+            )
+            has_prev = True  # Since we came from a previous question
+            
+            question_text = (
+                f"Вопрос от пользователя {question['username'] or question['user_id']}:\n\n"
+                f"{question['question']}"
+            )
+            
+            await callback.message.edit_text(
+                question_text,
+                reply_markup=await get_question_action_menu(question['id'], has_next, has_prev)
+            )
+    except Exception as e:
+        logger.error(f"Failed to get next question: {e}", exc_info=True)
+        sentry_sdk.capture_exception(e)
+        await callback.answer("Произошла ошибка при загрузке вопроса.")
+    finally:
+        await callback.answer()
+
 @dp.callback_query(F.data.startswith("answer_"))
 async def answer_question_handler(callback: types.CallbackQuery, state: FSMContext):
-    logger.info(f"Moderator {callback.from_user.id} answering question")
     question_id = int(callback.data.split("_")[1])
-    
     await state.update_data(question_id=question_id)
+    
+    # Сохраняем информацию о предыдущем/следующем вопросе из callback
+    parts = callback.data.split("_")
+    if len(parts) > 2:
+        await state.update_data(
+            prev_question=parts[2] if "prev" in parts else None,
+            next_question=parts[2] if "next" in parts else None
+        )
+    
     await callback.message.edit_text(
         "Введите ответ на вопрос:",
         reply_markup=None
@@ -2055,6 +2325,72 @@ async def answer_question_handler(callback: types.CallbackQuery, state: FSMConte
     )
     await state.set_state(Form.waiting_for_answer)
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("skip_"))
+async def skip_question_handler(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    question_id = int(parts[1])
+    moderator = callback.from_user
+    
+    # Проверяем, есть ли информация о следующем вопросе
+    next_question_id = None
+    if len(parts) > 2 and parts[2].isdigit():
+        next_question_id = int(parts[2])
+    
+    pool = await get_db_connection()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE questions SET skipped_at = CURRENT_TIMESTAMP WHERE id = $1",
+                question_id
+            )
+            
+            # Если есть следующий вопрос, загружаем его
+            if next_question_id:
+                next_question = await conn.fetchrow(
+                    "SELECT id, user_id, username, question FROM questions WHERE id = $1",
+                    next_question_id
+                )
+                
+                if next_question:
+                    # Проверяем навигацию для нового вопроса
+                    has_next = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM questions WHERE id > $1 AND answer IS NULL AND skipped_at IS NULL)",
+                        next_question['id']
+                    )
+                    has_prev = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM questions WHERE id < $1 AND answer IS NULL AND skipped_at IS NULL)",
+                        next_question['id']
+                    )
+                    
+                    question_text = (
+                        f"Вопрос от пользователя {next_question['username'] or next_question['user_id']}:\n\n"
+                        f"{next_question['question']}"
+                    )
+                    
+                    await callback.message.edit_text(
+                        question_text,
+                        reply_markup=await get_question_action_menu(next_question['id'], has_next, has_prev)
+                    )
+                    await callback.answer("Вопрос пропущен. Загружен следующий вопрос.")
+                    return
+            
+            await callback.message.edit_text(
+                "Вопрос пропущен.",
+                reply_markup=None
+            )
+            
+            # Notify other moderators
+            moderator_mention = await get_user_mention(moderator)
+            notify_text = f"Вопрос ID {question_id} был пропущен модератором {moderator_mention}"
+            await notify_moderators(notify_text, EMOJI_WARNING)
+            
+    except Exception as e:
+        logger.error(f"Failed to skip question {question_id}: {e}", exc_info=True)
+        sentry_sdk.capture_exception(e)
+        await callback.message.answer("Произошла ошибка при пропуске вопроса.")
+    finally:
+        await callback.answer()
 
 @dp.message(Form.waiting_for_answer, F.text == "❌ Отменить ответ")
 async def cancel_answer_handler(message: types.Message, state: FSMContext):
@@ -2113,7 +2449,7 @@ async def process_answer(message: types.Message, state: FSMContext):
             # Notify other moderators
             moderator_mention = await get_user_mention(moderator)
             notify_text = f"Вопрос ID {question_id} был отвечен модератором {moderator_mention}"
-            await notify_moderators(notify_text, EMOJI_DONE)
+            await notify_admins(notify_text, EMOJI_DONE)
             
     except Exception as e:
         logger.error(f"Failed to process answer for question {question_id}: {e}", exc_info=True)
@@ -2330,7 +2666,7 @@ async def process_contract_handler(callback: types.CallbackQuery):
             # Notify other moderators
             moderator_mention = await get_user_mention(moderator)
             notify_text = f"Договор {contract_type} ID {contract_id} обработан модератором {moderator_mention}"
-            await notify_moderators(notify_text, EMOJI_DONE)
+            await notify_admins(notify_text, EMOJI_DONE)
             
     except Exception as e:
         logger.error(f"Failed to process {contract_type} contract {contract_id}: {e}", exc_info=True)
@@ -2539,7 +2875,7 @@ async def process_time(message: types.Message, state: FSMContext):
         if send_time < datetime.now():
             raise ValueError("Время должно быть в будущем")
         
-        await state.update_data(send_time=send_time)
+        await state.update_data(send_time=send_time.isoformat())
         
         builder = ReplyKeyboardBuilder()
         builder.button(text="👥 Всем пользователям")
@@ -2582,6 +2918,9 @@ async def process_user_id(message: types.Message, state: FSMContext):
 
 async def confirm_and_save_message(message: types.Message, state: FSMContext):
     data = await state.get_data()
+	
+	# Конвертируем строку ISO формата обратно в datetime
+    send_time = datetime.fromisoformat(data['send_time'])
     
     pool = await get_db_connection()
     async with pool.acquire() as conn:
@@ -2596,7 +2935,7 @@ async def confirm_and_save_message(message: types.Message, state: FSMContext):
             data['content_type'],
             data.get('text_content'),
             data.get('photo_path'),
-            data['send_time'],
+            send_time,
             'pending',
             data['recipient_type'],
             data.get('recipient_id'),
@@ -2610,7 +2949,7 @@ async def confirm_and_save_message(message: types.Message, state: FSMContext):
         notify_text += f"📝 Текст: {data['text_content']}\n\n"
     
     notify_text += (
-        f"⏰ Время отправки: {data['send_time'].strftime('%d.%m.%Y %H:%M')}\n"
+        f"⏰ Время отправки: {datetime.fromisoformat(data['send_time']).strftime('%d.%m.%Y %H:%M')}\n"
         f"👥 Получатели: "
     )
     
@@ -2919,103 +3258,96 @@ async def clean_backups_handler(callback: types.CallbackQuery):
 
 @dp.message(F.text == "🔔 Управление уведомлениями")
 async def admin_notifications_handler(message: types.Message):
-    logger.info(f"Admin {message.from_user.id} managing notifications")
     if not await is_admin(message.from_user.id):
-        logger.warning(f"User {message.from_user.id} is not an admin")
         await message.answer("У вас нет доступа к этой функции.")
         return
     
-    try:
-        # Get current notification settings
-        questions_notify = await is_button_enabled('notify_questions')
-        contracts_notify = await is_button_enabled('notify_contracts')
-        errors_notify = await is_button_enabled('notify_errors')
-        
-        text = (
-            "🔔 Настройки уведомлений:\n\n"
-            f"1. Новые вопросы: {'вкл' if questions_notify else 'выкл'}\n"
-            f"2. Новые договоры: {'вкл' if contracts_notify else 'выкл'}\n"
-            f"3. Ошибки системы: {'вкл' if errors_notify else 'выкл'}\n\n"
-            "Выберите параметр для изменения:"
-        )
-        
-        builder = InlineKeyboardBuilder()
-        builder.button(text="1️⃣", callback_data="toggle_notify_questions")
-        builder.button(text="2️⃣", callback_data="toggle_notify_contracts")
-        builder.button(text="3️⃣", callback_data="toggle_notify_errors")
-        builder.button(text="⬅️ Назад", callback_data="admin_back")
-        builder.adjust(3, 1)
-        
-        await message.answer(
-            text,
-            reply_markup=builder.as_markup()
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to get notification settings: {e}", exc_info=True)
-        sentry_sdk.capture_exception(e)
-        await message.answer("Произошла ошибка при получении настроек уведомлений.")
+    await update_notifications_message(message)
 
-@dp.callback_query(F.data == "toggle_notify_questions")
-async def toggle_notify_questions_handler(callback: types.CallbackQuery):
-    logger.info(f"Admin {callback.from_user.id} toggling questions notifications")
+async def update_notifications_message(message: types.Message):
+    # Получаем текущие настройки
+    admin_questions = await is_notification_enabled('notify_admin_questions')
+    admin_contracts = await is_notification_enabled('notify_admin_contracts')
+    admin_errors = await is_notification_enabled('notify_admin_errors')
+    mod_questions = await is_notification_enabled('notify_moderators_questions')
+    mod_contracts = await is_notification_enabled('notify_moderators_contracts')
+    
+    text = (
+        "🔔 Настройки уведомлений:\n\n"
+        "📌 Для администратора:\n"
+        f"1. Новые вопросы: {'вкл' if admin_questions else 'выкл'}\n"
+        f"2. Новые договоры: {'вкл' if admin_contracts else 'выкл'}\n"
+        f"3. Ошибки системы: {'вкл' if admin_errors else 'выкл'}\n\n"
+        "📌 Для модераторов:\n"
+        f"4. Новые вопросы: {'вкл' if mod_questions else 'выкл'}\n"
+        f"5. Новые договоры: {'вкл' if mod_contracts else 'выкл'}\n\n"
+        "Выберите параметр для изменения:"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="1️⃣", callback_data="toggle_admin_questions")
+    builder.button(text="2️⃣", callback_data="toggle_admin_contracts")
+    builder.button(text="3️⃣", callback_data="toggle_admin_errors")
+    builder.button(text="4️⃣", callback_data="toggle_mod_questions")
+    builder.button(text="5️⃣", callback_data="toggle_mod_contracts")
+    builder.button(text="⬅️ Назад", callback_data="admin_back")
+    builder.adjust(3, 2, 1)
+    
     try:
-        current = await is_button_enabled('notify_questions')
-        new_value = not current
-        
-        pool = await get_db_connection()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO bot_settings (key, value) VALUES ($1, $2) "
-                "ON CONFLICT (key) DO UPDATE SET value = $2",
-                'notify_questions', '1' if new_value else '0'
-            )
-        
-        # Clear cache
-        redis_client.delete('button:notify_questions')
-        
-        # Update message
-        questions_notify = new_value
-        contracts_notify = await is_button_enabled('notify_contracts')
-        errors_notify = await is_button_enabled('notify_errors')
-        
-        text = (
-            "🔔 Настройки уведомлений:\n\n"
-            f"1. Новые вопросы: {'вкл' if questions_notify else 'выкл'}\n"
-            f"2. Новые договоры: {'вкл' if contracts_notify else 'выкл'}\n"
-            f"3. Ошибки системы: {'вкл' if errors_notify else 'выкл'}\n\n"
-            "Выберите параметр для изменения:"
+        await message.edit_text(text, reply_markup=builder.as_markup())
+    except:
+        await message.answer(text, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "toggle_admin_questions")
+async def toggle_admin_questions(callback: types.CallbackQuery):
+    await toggle_notification_setting(callback, 'notify_admin_questions')
+
+@dp.callback_query(F.data == "toggle_admin_contracts")
+async def toggle_admin_contracts(callback: types.CallbackQuery):
+    await toggle_notification_setting(callback, 'notify_admin_contracts')
+
+@dp.callback_query(F.data == "toggle_admin_errors")
+async def toggle_admin_errors(callback: types.CallbackQuery):
+    await toggle_notification_setting(callback, 'notify_admin_errors')
+
+@dp.callback_query(F.data == "toggle_mod_questions")
+async def toggle_mod_questions(callback: types.CallbackQuery):
+    await toggle_notification_setting(callback, 'notify_moderators_questions')
+
+@dp.callback_query(F.data == "toggle_mod_contracts")
+async def toggle_mod_contracts(callback: types.CallbackQuery):
+    await toggle_notification_setting(callback, 'notify_moderators_contracts')
+
+async def toggle_notification_setting(callback: types.CallbackQuery, setting_key: str):
+    current = await is_notification_enabled(setting_key)
+    new_value = not current
+    
+    pool = await get_db_connection()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) "
+            "ON CONFLICT (key) DO UPDATE SET value = $2",
+            setting_key, '1' if new_value else '0'
         )
-        
-        builder = InlineKeyboardBuilder()
-        builder.button(text="1️⃣", callback_data="toggle_notify_questions")
-        builder.button(text="2️⃣", callback_data="toggle_notify_contracts")
-        builder.button(text="3️⃣", callback_data="toggle_notify_errors")
-        builder.button(text="⬅️ Назад", callback_data="admin_back")
-        builder.adjust(3, 1)
-        
-        await callback.message.edit_text(
-            text,
-            reply_markup=builder.as_markup()
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to toggle questions notifications: {e}", exc_info=True)
-        sentry_sdk.capture_exception(e)
-        await callback.message.answer("Не удалось изменить настройки уведомлений.")
-    finally:
-        await callback.answer()
+    
+    # Clear cache
+    redis_client.delete(f'notification:{setting_key}')
+    
+    # Update message
+    await update_notifications_message(callback.message)
+    await callback.answer(f"Уведомления {'включены' if new_value else 'выключены'}")
 
 async def display_contract(callback: types.CallbackQuery, contract: dict, contract_type: str, has_more: bool):
     try:
         if contract_type == "physical":
             try:
+                # Расшифровка всех зашифрованных полей
                 phone = decrypt_data(contract['phone'])
                 passport_id = decrypt_data(contract['passport_id'])
             except Exception as e:
                 logger.error(f"Failed to decrypt contract data: {e}", exc_info=True)
-                phone = "[зашифровано]"
-                passport_id = "[зашифровано]"
+                phone = "[ошибка расшифровки]"
+                passport_id = "[ошибка расшифровки]"
             
             text = (
                 f"Договор физ. лица (ID: {contract['id']})\n\n"
@@ -3034,16 +3366,17 @@ async def display_contract(callback: types.CallbackQuery, contract: dict, contra
             )
         else:
             try:
+                # Расшифровка всех зашифрованных полей для юр.лица
                 phone = decrypt_data(contract['phone'])
-                okpo = decrypt_data(contract['okpo'])
+                okpo = decrypt_data(contract['okpo']) if contract['okpo'] else "не указано"
                 unp = decrypt_data(contract['unp'])
                 account = decrypt_data(contract['account_number'])
             except Exception as e:
                 logger.error(f"Failed to decrypt contract data: {e}", exc_info=True)
-                phone = "[зашифровано]"
-                okpo = "[зашифровано]"
-                unp = "[зашифровано]"
-                account = "[зашифровано]"
+                phone = "[ошибка расшифровки]"
+                okpo = "[ошибка расшифровки]"
+                unp = "[ошибка расшифровки]"
+                account = "[ошибка расшифровки]"
             
             text = (
                 f"Договор юр. лица (ID: {contract['id']})\n\n"
@@ -3220,10 +3553,12 @@ async def admin_buttons_handler(message: types.Message):
         
         text = (
             "🛠 Управление кнопками:\n\n"
+			"📌 Для пользователей:\n"
             f"1. ❓ Консультация: {'вкл' if consultation else 'выкл'}\n"
             f"2. 💰 Расчёт окупаемости: {'вкл' if roi else 'выкл'}\n"
-            f"3. 🎥📚 Опыт эксплуатации: {'вкл' if experience else 'выкл'}\n"
-            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n"
+            f"3. 🎥📚Полезная информация: {'вкл' if experience else 'выкл'}\n"
+            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n\n"
+			"📌 Для модераторов:\n"
             f"5. 📋 Неотвеченные вопросы: {'вкл' if questions else 'выкл'}\n"
             f"6. 📝 Просмотреть договоры: {'вкл' if contracts else 'выкл'}\n"
             f"7. ⏱ Отложенные сообщения: {'вкл' if delayed else 'выкл'}\n\n"
@@ -3284,10 +3619,12 @@ async def toggle_button_consultation_handler(callback: types.CallbackQuery):
         
         text = (
             "🛠 Управление кнопками:\n\n"
+			"📌 Для пользователей:\n"
             f"1. ❓ Консультация: {'вкл' if consultation else 'выкл'}\n"
             f"2. 💰 Расчёт окупаемости: {'вкл' if roi else 'выкл'}\n"
-            f"3. 🎥📚 Опыт эксплуатации: {'вкл' if experience else 'выкл'}\n"
-            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n"
+            f"3. 🎥📚Полезная информация: {'вкл' if experience else 'выкл'}\n"
+            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n\n"
+			"📌 Для модераторов:\n"
             f"5. 📋 Неотвеченные вопросы: {'вкл' if questions else 'выкл'}\n"
             f"6. 📝 Просмотреть договоры: {'вкл' if contracts else 'выкл'}\n"
             f"7. ⏱ Отложенные сообщения: {'вкл' if delayed else 'выкл'}\n\n"
@@ -3346,10 +3683,12 @@ async def toggle_button_roi_handler(callback: types.CallbackQuery):
         
         text = (
             "🛠 Управление кнопками:\n\n"
+			"📌 Для пользователей:\n"
             f"1. ❓ Консультация: {'вкл' if consultation else 'выкл'}\n"
             f"2. 💰 Расчёт окупаемости: {'вкл' if roi else 'выкл'}\n"
-            f"3. 🎥📚 Опыт эксплуатации: {'вкл' if experience else 'выкл'}\n"
-            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n"
+            f"3. 🎥📚Полезная информация: {'вкл' if experience else 'выкл'}\n"
+            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n\n"
+			"📌 Для модераторов:\n"
             f"5. 📋 Неотвеченные вопросы: {'вкл' if questions else 'выкл'}\n"
             f"6. 📝 Просмотреть договоры: {'вкл' if contracts else 'выкл'}\n"
             f"7. ⏱ Отложенные сообщения: {'вкл' if delayed else 'выкл'}\n\n"
@@ -3408,10 +3747,12 @@ async def toggle_button_experience_handler(callback: types.CallbackQuery):
         
         text = (
             "🛠 Управление кнопками:\n\n"
+			"📌 Для пользователей:\n"
             f"1. ❓ Консультация: {'вкл' if consultation else 'выкл'}\n"
             f"2. 💰 Расчёт окупаемости: {'вкл' if roi else 'выкл'}\n"
-            f"3. 🎥📚 Опыт эксплуатации: {'вкл' if experience else 'выкл'}\n"
-            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n"
+            f"3. 🎥📚Полезная информация: {'вкл' if experience else 'выкл'}\n"
+            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n\n"
+			"📌 Для модераторов:\n"
             f"5. 📋 Неотвеченные вопросы: {'вкл' if questions else 'выкл'}\n"
             f"6. 📝 Просмотреть договоры: {'вкл' if contracts else 'выкл'}\n"
             f"7. ⏱ Отложенные сообщения: {'вкл' if delayed else 'выкл'}\n\n"
@@ -3470,10 +3811,12 @@ async def toggle_button_contract_handler(callback: types.CallbackQuery):
         
         text = (
             "🛠 Управление кнопками:\n\n"
+			"📌 Для пользователей:\n"
             f"1. ❓ Консультация: {'вкл' if consultation else 'выкл'}\n"
             f"2. 💰 Расчёт окупаемости: {'вкл' if roi else 'выкл'}\n"
-            f"3. 🎥📚 Опыт эксплуатации: {'вкл' if experience else 'выкл'}\n"
-            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n"
+            f"3. 🎥📚Полезная информация: {'вкл' if experience else 'выкл'}\n"
+            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n\n"
+			"📌 Для модераторов:\n"
             f"5. 📋 Неотвеченные вопросы: {'вкл' if questions else 'выкл'}\n"
             f"6. 📝 Просмотреть договоры: {'вкл' if contracts else 'выкл'}\n"
             f"7. ⏱ Отложенные сообщения: {'вкл' if delayed else 'выкл'}\n\n"
@@ -3531,10 +3874,12 @@ async def toggle_button_unanswered_questions(callback: types.CallbackQuery):
         
         text = (
             "🛠 Управление кнопками:\n\n"
+			"📌 Для пользователей:\n"
             f"1. ❓ Консультация: {'вкл' if consultation else 'выкл'}\n"
             f"2. 💰 Расчёт окупаемости: {'вкл' if roi else 'выкл'}\n"
-            f"3. 🎥📚 Опыт эксплуатации: {'вкл' if experience else 'выкл'}\n"
-            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n"
+            f"3. 🎥📚Полезная информация: {'вкл' if experience else 'выкл'}\n"
+            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n\n"
+			"📌 Для модераторов:\n"
             f"5. 📋 Неотвеченные вопросы: {'вкл' if questions else 'выкл'}\n"
             f"6. 📝 Просмотреть договоры: {'вкл' if contracts else 'выкл'}\n"
             f"7. ⏱ Отложенные сообщения: {'вкл' if delayed else 'выкл'}\n\n"
@@ -3592,10 +3937,12 @@ async def toggle_button_unanswered_questions(callback: types.CallbackQuery):
         
         text = (
             "🛠 Управление кнопками:\n\n"
+			"📌 Для пользователей:\n"
             f"1. ❓ Консультация: {'вкл' if consultation else 'выкл'}\n"
             f"2. 💰 Расчёт окупаемости: {'вкл' if roi else 'выкл'}\n"
-            f"3. 🎥📚 Опыт эксплуатации: {'вкл' if experience else 'выкл'}\n"
-            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n"
+            f"3. 🎥📚Полезная информация: {'вкл' if experience else 'выкл'}\n"
+            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n\n"
+			"📌 Для модераторов:\n"
             f"5. 📋 Неотвеченные вопросы: {'вкл' if questions else 'выкл'}\n"
             f"6. 📝 Просмотреть договоры: {'вкл' if contracts else 'выкл'}\n"
             f"7. ⏱ Отложенные сообщения: {'вкл' if delayed else 'выкл'}\n\n"
@@ -3653,10 +4000,12 @@ async def toggle_button_unanswered_questions(callback: types.CallbackQuery):
         
         text = (
             "🛠 Управление кнопками:\n\n"
+			"📌 Для пользователей:\n"
             f"1. ❓ Консультация: {'вкл' if consultation else 'выкл'}\n"
             f"2. 💰 Расчёт окупаемости: {'вкл' if roi else 'выкл'}\n"
-            f"3. 🎥📚 Опыт эксплуатации: {'вкл' if experience else 'выкл'}\n"
-            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n"
+            f"3. 🎥📚Полезная информация: {'вкл' if experience else 'выкл'}\n"
+            f"4. 📝 Договор: {'вкл' if contract else 'выкл'}\n\n"
+			"📌 Для модераторов:\n"
             f"5. 📋 Неотвеченные вопросы: {'вкл' if questions else 'выкл'}\n"
             f"6. 📝 Просмотреть договоры: {'вкл' if contracts else 'выкл'}\n"
             f"7. ⏱ Отложенные сообщения: {'вкл' if delayed else 'выкл'}\n\n"
@@ -4049,25 +4398,19 @@ async def on_shutdown():
     redis_client.close()
 
 # Main function
-@app.on_event("startup")
-async def on_startup():
-    await bot.set_webhook(
-        url=config.WEBHOOK_URL,
-        secret_token=config.WEBHOOK_SECRET
-    )
-    await init_db()
-    asyncio.create_task(send_scheduled_messages())
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await bot.delete_webhook()
-    await dp.storage.close()
-    await bot.session.close()
-
-@app.post(f"/{config.WEBHOOK_PATH}")
-async def bot_webhook(update: dict):
-    telegram_update = types.Update(**update)
-    await dp.feed_update(bot, telegram_update)
+async def main():
+    logger.info("Starting bot...")
+    
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=config.WEBHOOK_HOST, port=config.WEBHOOK_PORT)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sentry_sdk.capture_exception(e)

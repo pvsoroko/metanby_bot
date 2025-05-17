@@ -104,10 +104,7 @@ class Config:
         self.ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
         self.SENTRY_DSN = os.getenv("SENTRY_DSN")
         self.ENVIRONMENT = os.getenv("ENVIRONMENT")
-        self.WEB_USERNAME = os.getenv("WEB_USERNAME")
-        self.WEB_PASSWORD = os.getenv("WEB_PASSWORD")
-        self.WEB_HOST = os.getenv("WEB_HOST")
-        self.WEB_PORT = int(os.getenv("WEB_PORT"))
+
         
         if not self.BOT_TOKEN:
             raise ValueError("BOT_TOKEN is required")

@@ -19,33 +19,14 @@ import redis
 import asyncio
 import shutil
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-import uvicorn
 import sentry_sdk
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 from sentry_sdk.integrations.logging import LoggingIntegration
-import html
 import re
-from fastapi.responses import FileResponse, RedirectResponse
-from pathlib import Path
-import subprocess
-from aiogram.types import BufferedInputFile
-from fastapi import Form
-from fastapi.responses import StreamingResponse
-from io import StringIO
-import json
-import sentry_sdk
-from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.exceptions import TelegramBadRequest
 
 # Создаем необходимые директории перед инициализацией приложения
-os.makedirs("static", exist_ok=True)
-os.makedirs("templates", exist_ok=True)
 os.makedirs("backups", exist_ok=True)
 os.makedirs("temp", exist_ok=True)
 
@@ -104,7 +85,6 @@ class Config:
         self.ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
         self.SENTRY_DSN = os.getenv("SENTRY_DSN")
         self.ENVIRONMENT = os.getenv("ENVIRONMENT")
-
         
         if not self.BOT_TOKEN:
             raise ValueError("BOT_TOKEN is required")
@@ -148,358 +128,6 @@ def decrypt_data(encrypted_data: str) -> str:
         logger.error(f"Decryption failed: {e}", exc_info=True)
         sentry_sdk.capture_exception(e)
         raise
-
-# FastAPI app
-app = FastAPI(title="METAN.BY Bot Admin Interface")
-security = HTTPBasic()
-app.add_middleware(SentryAsgiMiddleware)
-
-# Mount static files and templates
-app.mount("/static", StaticFiles(directory="static"), name="static")
-app.mount("/backups", StaticFiles(directory="backups"), name="backups")
-templates = Jinja2Templates(directory="templates")
-
-# Basic auth for web interface
-async def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = credentials.username == config.WEB_USERNAME
-    correct_password = credentials.password == config.WEB_PASSWORD
-    
-    if not (correct_username and correct_password):
-        logger.warning(f"Failed login attempt for username: {credentials.username}")
-        raise HTTPException(
-            status_code=401,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
-
-# Web routes
-@app.get("/logs", response_class=HTMLResponse)
-async def logs_ui(request: Request, username: str = Depends(get_current_user)):
-    return templates.TemplateResponse("logs.html", {"request": request})
-
-@app.get("/users", response_class=HTMLResponse)
-async def users_ui(request: Request, username: str = Depends(get_current_user)):
-    return templates.TemplateResponse("users.html", {"request": request})
-
-@app.get("/api/users")
-async def get_users(
-    search: str = "",
-    status: str = "all",
-    page: int = 1,
-    per_page: int = 10,
-    username: str = Depends(get_current_user)
-):
-    pool = await get_db_connection()
-    offset = (page - 1) * per_page
-    
-    query = "SELECT * FROM users WHERE 1=1"
-    params = []
-    
-    if search:
-        query += " AND (username ILIKE $1 OR first_name ILIKE $1 OR last_name ILIKE $1)"
-        params.append(f"%{search}%")
-    
-    if status == "active":
-        query += " AND last_activity > NOW() - INTERVAL '7 days'"
-    elif status == "inactive":
-        query += " AND last_activity <= NOW() - INTERVAL '7 days'"
-    
-    # Получаем пользователей
-    users = await pool.fetch(
-        f"{query} ORDER BY last_activity DESC LIMIT ${len(params)+1} OFFSET ${len(params)+2}",
-        *params, per_page, offset
-    )
-    
-    # Получаем общее количество
-    count = await pool.fetchval(f"SELECT COUNT(*) FROM ({query}) AS subq", *params)
-    
-    return {
-        "users": users,
-        "total": count,
-        "page": page,
-        "per_page": per_page
-    }
-
-@app.get("/api/logs")
-async def get_logs(
-    level: str = "all",
-    date_from: str = None,
-    date_to: str = None,
-    search: str = "",
-    page: int = 1,
-    per_page: int = 10,
-    username: str = Depends(get_current_user)
-):
-    # В реальном проекте подключите Sentry API или читайте из файла логов
-    # Здесь примерная реализация
-    logs = []
-    try:
-        with open("bot.log", "r") as f:
-            logs = f.readlines()[-1000:]  # Последние 1000 строк
-    except:
-        pass
-    
-    # Фильтрация (упрощенная)
-    filtered = []
-    for log in logs:
-        if level != "all" and level.lower() not in log.lower():
-            continue
-        if search and search.lower() not in log.lower():
-            continue
-        filtered.append(log)
-    
-    # Пагинация
-    total = len(filtered)
-    paginated = filtered[(page-1)*per_page : page*per_page]
-    
-    return {
-        "logs": paginated,
-        "total": total,
-        "page": page,
-        "per_page": per_page
-    }
-
-@app.get("/api/stats")
-async def get_stats(
-    period: str = "week",  # day/week/month/year
-    username: str = Depends(get_current_user)
-):
-    pool = await get_db_connection()
-    
-    # Определяем интервал для периода
-    intervals = {
-        "day": "1 day",
-        "week": "1 week",
-        "month": "1 month",
-        "year": "1 year"
-    }
-    interval = intervals.get(period, "1 week")
-
-    # 1. Динамика регистраций пользователей
-    users_dynamic = await pool.fetch(f"""
-        SELECT 
-            date_trunc('hour', registered_at) as time_point,
-            COUNT(*) as count
-        FROM users
-        WHERE registered_at >= NOW() - INTERVAL '{interval}'
-        GROUP BY time_point
-        ORDER BY time_point
-    """)
-
-    # 2. Динамика вопросов
-    questions_dynamic = await pool.fetch(f"""
-        SELECT 
-            date_trunc('hour', registered_at) as time_point,
-            COUNT(*) as count
-        FROM questions
-        WHERE created_at >= NOW() - INTERVAL '{interval}'
-        GROUP BY time_point
-        ORDER BY time_point
-    """)
-
-    # 3. Общая статистика
-    total_stats = await pool.fetchrow("""
-        SELECT
-            (SELECT COUNT(*) FROM users) as total_users,
-            (SELECT COUNT(*) FROM questions) as total_questions,
-            (SELECT COUNT(*) FROM questions WHERE answer IS NOT NULL) as answered_questions,
-            (SELECT COUNT(*) FROM contracts_physical) as physical_contracts,
-            (SELECT COUNT(*) FROM contracts_legal) as legal_contracts
-    """)
-
-    return {
-        "dynamics": {
-            "users": [{"time": str(r["time_point"]), "count": r["count"]} for r in users_dynamic],
-            "questions": [{"time": str(r["time_point"]), "count": r["count"]} for r in questions_dynamic]
-        },
-        "totals": dict(total_stats)
-    }
-
-@app.get("/settings", response_class=HTMLResponse)
-async def settings_ui(request: Request, username: str = Depends(get_current_user)):
-    pool = await get_db_connection()
-    settings = {
-        "welcome_message": await pool.fetchval("SELECT value FROM bot_settings WHERE key = 'welcome_message'"),
-        "experience_video_link": await pool.fetchval("SELECT value FROM bot_settings WHERE key = 'experience_video_link'"),
-        "experience_docs_link": await pool.fetchval("SELECT value FROM bot_settings WHERE key = 'experience_docs_link'"),
-    }
-    return templates.TemplateResponse("settings.html", {"request": request, "settings": settings})
-
-@app.post("/settings")
-async def update_settings(
-    welcome_message: str = Form(...),
-    experience_video_link: str = Form(...),
-    experience_docs_link: str = Form(...),
-    username: str = Depends(get_current_user)
-):
-    pool = await get_db_connection()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
-            "welcome_message", welcome_message
-        )
-        await conn.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
-            "experience_video_link", experience_video_link
-        )
-        await conn.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
-            "experience_docs_link", experience_docs_link
-        )
-    
-    return RedirectResponse(url="/settings", status_code=303)
-	
-@app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request, username: str = Depends(get_current_user)):
-    logger.info(f"Web interface accessed by {username}")
-    return templates.TemplateResponse("index.html", {"request": request})
-
-@app.get("/health")
-async def health_check():
-    logger.info("Health check requested")
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-@app.get("/backup", response_class=HTMLResponse)
-async def backup_ui(request: Request, username: str = Depends(get_current_user)):
-    backups = []
-    if os.path.exists("backups"):
-        backups = sorted(os.listdir("backups"), reverse=True)[:5]
-    return templates.TemplateResponse("backup.html", {
-        "request": request,
-        "backups": backups
-    })
-
-@app.post("/backup")
-async def create_backup_ui(username: str = Depends(get_current_user)):
-    try:
-        os.makedirs("backups", exist_ok=True)
-        backup_name = f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.sql"
-        backup_path = f"backups/{backup_name}"
-        
-        # Используем синхронный subprocess.run
-        result = subprocess.run(
-            f"pg_dump {config.POSTGRES_DSN} > {backup_path}",
-            shell=True,
-            capture_output=True,
-            text=True
-        )
-        
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr)
-            
-        return RedirectResponse(url="/backup", status_code=303)
-        
-    except Exception as e:
-        logger.error(f"Backup failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Backup creation failed: {str(e)}"
-        )
-        
-@app.get("/export", response_class=HTMLResponse)
-async def export_data(request: Request, username: str = Depends(get_current_user)):
-    pool = await get_db_connection()
-    async with pool.acquire() as conn:
-        data = {
-            "questions": await conn.fetchval("SELECT COUNT(*) FROM questions"),
-            "contracts": await conn.fetchval("SELECT COUNT(*) FROM contracts_physical") + 
-                        await conn.fetchval("SELECT COUNT(*) FROM contracts_legal")
-        }
-    return templates.TemplateResponse("export.html", {
-        "request": request,
-        "data": data
-    })
-    
-@app.get("/export/questions.csv")
-async def export_questions_csv(username: str = Depends(get_current_user)):
-    csv_path = await export_questions_to_csv()
-    if not csv_path:
-        raise HTTPException(
-            status_code=404,
-            detail="No questions found or export failed"
-        )
-    
-    # Проверяем размер файла
-    if os.path.getsize(csv_path) == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Exported file is empty"
-        )
-    
-    return FileResponse(
-        csv_path,
-        filename="questions.csv",
-        media_type="text/csv"
-    )
-
-@app.get("/export/physical_contracts.csv")
-async def export_physical_contracts_csv(username: str = Depends(get_current_user)):
-    csv_path = await export_physical_contracts_to_csv()
-    if not csv_path:
-        raise HTTPException(
-            status_code=404,
-            detail="No physical contracts found or export failed"
-        )
-    
-    # Проверяем размер файла
-    if os.path.getsize(csv_path) == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Exported file is empty"
-        )
-    
-    return FileResponse(
-        csv_path,
-        filename="physical_contracts.csv",
-        media_type="text/csv"
-    )
-
-@app.get("/export/legal_contracts.csv")
-async def export_legal_contracts_csv(username: str = Depends(get_current_user)):
-    csv_path = await export_legal_contracts_to_csv()
-    if not csv_path:
-        raise HTTPException(
-            status_code=404,
-            detail="No legal contracts found or export failed"
-        )
-    
-    # Проверяем размер файла
-    if os.path.getsize(csv_path) == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Exported file is empty"
-        )
-    
-    return FileResponse(
-        csv_path,
-        filename="legal_contracts.csv",
-        media_type="text/csv"
-    )
-
-@app.get("/stats", response_class=HTMLResponse)
-async def get_stats(request: Request, username: str = Depends(get_current_user)):
-    logger.info(f"Stats requested by {username}")
-    try:
-        pool = await get_db_connection()
-        async with pool.acquire() as conn:
-            stats = {
-                "users": await conn.fetchval("SELECT COUNT(*) FROM users"),
-                "questions": await conn.fetchval("SELECT COUNT(*) FROM questions"),
-                "answered_questions": await conn.fetchval("SELECT COUNT(*) FROM questions WHERE answer IS NOT NULL"),
-                "physical_contracts": await conn.fetchval("SELECT COUNT(*) FROM contracts_physical"),
-                "legal_contracts": await conn.fetchval("SELECT COUNT(*) FROM contracts_legal"),
-            }
-        
-        return templates.TemplateResponse("stats.html", {
-            "request": request,
-            "stats": stats,
-            "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-    except Exception as e:
-        logger.error(f"Failed to get stats: {e}", exc_info=True)
-        sentry_sdk.capture_exception(e)
-        raise HTTPException(status_code=500, detail=str(e))
 
 # Emoji constants
 EMOJI_NEW = "🆕"
@@ -840,9 +468,7 @@ async def init_db():
             # Добавляем начальные настройки
             await conn.execute("""
             INSERT INTO bot_settings (key, value) VALUES 
-                ('welcome_message', 'Добро пожаловать в бот METAN.BY!'),
-                ('experience_video_link', 'https://example.com/video'),
-                ('experience_docs_link', 'https://example.com/docs')
+                ('welcome_message', 'Добро пожаловать в бот METAN.BY!')
             ON CONFLICT (key) DO NOTHING
             """)
             await conn.execute("""
@@ -4374,17 +4000,6 @@ async def on_startup():
     asyncio.create_task(send_scheduled_messages())
     await init_db()
     await notify_admins("Бот запущен и готов к работе", EMOJI_INFO)
-    
-    # Start FastAPI server in background
-    if os.getenv("RUN_WEB", "true").lower() == "true":
-        uvicorn_config = uvicorn.Config(  # Используйте другое имя переменной
-            app,
-            host=config.WEB_HOST,
-            port=config.WEB_PORT,
-            log_level="info"
-        )
-        server = uvicorn.Server(uvicorn_config)
-        asyncio.create_task(server.serve())
 
 async def on_shutdown():
     logger.info("Bot shutting down...")
